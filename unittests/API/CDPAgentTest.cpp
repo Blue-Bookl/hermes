@@ -16,15 +16,17 @@
 #include <hermes/AsyncDebuggerAPI.h>
 #include <hermes/CompileJS.h>
 #include <hermes/Support/JSONEmitter.h>
+#include <hermes/Support/SerialExecutor.h>
 #include <hermes/cdp/CDPAgent.h>
 #include <hermes/cdp/CDPDebugAPI.h>
 #include <hermes/cdp/JSONValueInterfaces.h>
 #include <hermes/hermes.h>
-#include <hermes/inspector/chrome/tests/SerialExecutor.h>
+#include <jsi/instrumentation.h>
 
 #include <llvh/ADT/ScopeExit.h>
 
 #include "CDPJSONHelpers.h"
+#include "CDPTestHelpers.h"
 
 #if !defined(_WINDOWS) && !defined(__EMSCRIPTEN__)
 #include <sys/resource.h>
@@ -38,6 +40,14 @@ using namespace std::chrono_literals;
 using namespace std::placeholders;
 
 constexpr auto kDefaultUrl = "url";
+
+// A function passed to Runtime.callFunctionOn in order to invoke a getter. See
+// https://github.com/facebookexperimental/rn-chrome-devtools-frontend/blob/58eff7d6a4ed165a3350c8817c1ec5724eab5cb7/front_end/ui/legacy/components/object_ui/ObjectPropertiesSection.ts#L1125-L1132
+constexpr auto kInvokeGetterFunction = R"(
+  function invokeGetter(getter) {
+    return Function.prototype.apply.call(getter, this, []);
+  }
+)";
 
 template <typename T>
 T waitFor(
@@ -116,6 +126,10 @@ class CDPAgentTest : public ::testing::Test {
       std::string context = "reply",
       std::chrono::milliseconds timeout = std::chrono::milliseconds(2500));
 
+  /// check to see if a response or notification is immediately available.
+  /// returns the message, or nullopt if no message is available.
+  std::optional<std::string> tryGetMessage();
+
   void expectNothing();
   JSONObject *expectNotification(const std::string &method);
   JSONObject *expectResponse(const std::optional<std::string> &method, int id);
@@ -125,14 +139,28 @@ class CDPAgentTest : public ::testing::Test {
   void expectErrorMessageContaining(
       const std::string &substring,
       long long messageID);
+  /// Expect a sequence of messages conveying a heap snapshot:
+  /// 1 or more notifications containing chunks of the snapshot JSON object
+  /// followed by an OK response to the snapshot request.
+  /// \p messageID specifies the id of the snapshot request.
+  /// \p ignoreTrackingNotifications indicates whether lastSeenObjectId and
+  /// heapStatsUpdate notifications are tolerated before the snapshot arrives.
+  void expectHeapSnapshot(
+      int messageID,
+      bool ignoreTrackingNotifications = false);
 
   void sendRequest(
       const std::string &method,
       int id,
-      const std::function<void(::hermes::JSONEmitter &)> &setParameters = {});
+      const std::function<void(::hermes::JSONEmitter &)> &setParameters = {},
+      CDPAgent *altAgent = nullptr);
   void sendParameterlessRequest(const std::string &method, int id);
   void sendAndCheckResponse(const std::string &method, int id);
-  void sendEvalRequest(int id, int callFrameId, const std::string &expression);
+  void sendEvalRequest(
+      int id,
+      int callFrameId,
+      const std::string &expression,
+      CDPAgent *altAgent = nullptr);
 
   jsi::Value shouldStop(
       jsi::Runtime &runtime,
@@ -149,16 +177,29 @@ class CDPAgentTest : public ::testing::Test {
   void waitForTestSignal(
       std::chrono::milliseconds timeout = std::chrono::milliseconds(2500));
 
-  std::unordered_map<std::string, std::string> getAndEnsureProps(
+  /// Store a value provided by a test script so it can be later used by a
+  /// test.
+  jsi::Value storeValue(
+      jsi::Runtime &runtime,
+      const jsi::Value &thisVal,
+      const jsi::Value *args,
+      size_t count);
+
+  /// Move the previously stored value out of the storage location and
+  /// return it.
+  jsi::Value takeStoredValue();
+
+  m::runtime::GetPropertiesResponse getAndEnsureProps(
       int msgId,
       const std::string &objectId,
       const std::unordered_map<std::string, PropInfo> &infos,
-      bool ownProperties = true);
+      const std::unordered_map<std::string, PropInfo> &internalInfos = {},
+      bool ownProperties = true,
+      bool accessorPropertiesOnly = false);
 
   std::unique_ptr<HermesRuntime> runtime_;
   std::unique_ptr<CDPDebugAPI> cdpDebugAPI_;
-  std::unique_ptr<facebook::hermes::inspector_modern::chrome::SerialExecutor>
-      runtimeThread_;
+  std::unique_ptr<::hermes::SerialExecutor> runtimeThread_;
   std::unique_ptr<CDPAgent> cdpAgent_;
 
   std::atomic<bool> stopFlag_{};
@@ -166,6 +207,12 @@ class CDPAgentTest : public ::testing::Test {
   std::mutex testSignalMutex_;
   std::condition_variable testSignalCondition_;
   bool testSignalled_ = false;
+
+  /// Mutex to protect storedValue_, as it is typically written on the runtime
+  /// thread (via the "storeValue" host function), and read from the test
+  /// thread (via "takeStoredValue").
+  std::mutex storedValueMutex_;
+  jsi::Value storedValue_;
 
   std::mutex messageMutex_;
   std::condition_variable hasMessage_;
@@ -191,12 +238,9 @@ void CDPAgentTest::setupRuntimeTestInfra() {
   // thread is the main thread of the HermesRuntime.
   struct rlimit limit;
   getrlimit(RLIMIT_STACK, &limit);
-  runtimeThread_ = std::make_unique<
-      facebook::hermes::inspector_modern::chrome::SerialExecutor>(
-      limit.rlim_cur);
+  runtimeThread_ = std::make_unique<::hermes::SerialExecutor>(limit.rlim_cur);
 #else
-  runtimeThread_ = std::make_unique<
-      facebook::hermes::inspector_modern::chrome::SerialExecutor>();
+  runtimeThread_ = std::make_unique<::hermes::SerialExecutor>();
 #endif
 
   auto builder = ::hermes::vm::RuntimeConfig::Builder();
@@ -217,11 +261,22 @@ void CDPAgentTest::setupRuntimeTestInfra() {
           jsi::PropNameID::forAscii(*runtime_, "signalTest"),
           0,
           std::bind(&CDPAgentTest::signalTest, this, _1, _2, _3, _4)));
+  runtime_->global().setProperty(
+      *runtime_,
+      "storeValue",
+      jsi::Function::createFromHostFunction(
+          *runtime_,
+          jsi::PropNameID::forAscii(*runtime_, "storeValue"),
+          0,
+          std::bind(&CDPAgentTest::storeValue, this, _1, _2, _3, _4)));
 
   cdpDebugAPI_ = CDPDebugAPI::create(*runtime_);
 }
 
 void CDPAgentTest::TearDown() {
+  // Drop reference to value inside the runtime
+  storedValue_ = jsi::Value::undefined();
+
   // CDPAgent can be cleaned up from any thread and at any time without
   // synchronization with the runtime thread.
   cdpAgent_.reset();
@@ -257,6 +312,21 @@ std::string CDPAgentTest::waitForMessage(
     throw std::runtime_error("timed out waiting for " + context);
   }
 
+  std::string message = std::move(messages_.front());
+  messages_.pop();
+  return message;
+}
+
+std::optional<std::string> CDPAgentTest::tryGetMessage() {
+  // Take a message, if present, while holding the mutex protecting the message
+  // collection. This doesn't clear the "hasMessage_" notification, so it could
+  // leave "hasMessage_" signaled when there is no message waiting. This is
+  // okay, because waiting on "hasMessage_" elsewhere tolerates spurious
+  // wake-ups by also checking "messages_.empty()".
+  std::unique_lock<std::mutex> lock(messageMutex_);
+  if (messages_.empty()) {
+    return std::nullopt;
+  }
   std::string message = std::move(messages_.front());
   messages_.pop();
   return message;
@@ -302,6 +372,31 @@ void CDPAgentTest::expectErrorMessageContaining(
   ASSERT_NE(errorMessage.find(substring), std::string::npos);
 }
 
+void CDPAgentTest::expectHeapSnapshot(
+    int messageID,
+    bool ignoreTrackingNotifications) {
+  // Expect chunk notifications until the snapshot object is complete. Fail if
+  // the object is invalid (e.g. truncated data, excess data, malformed JSON).
+  // There is no indication of how many segments there will be, so just receive
+  // until the object is complete, then expect no more.
+  std::stringstream snapshot;
+  do {
+    JSONObject *note = jsonScope_.parseObject(waitForMessage());
+    std::string method = jsonScope_.getString(note, {"method"});
+    if (ignoreTrackingNotifications &&
+        (method == "HeapProfiler.lastSeenObjectId" ||
+         method == "HeapProfiler.heapStatsUpdate")) {
+      continue;
+    }
+
+    ASSERT_EQ(method, "HeapProfiler.addHeapSnapshotChunk");
+    snapshot << jsonScope_.getString(note, {"params", "chunk"});
+  } while (!jsonScope_.tryParseObject(snapshot.str()).has_value());
+
+  // Expect the snapshot response after all chunks have been received.
+  ensureOkResponse(waitForMessage(), messageID);
+}
+
 jsi::Value CDPAgentTest::shouldStop(
     jsi::Runtime &runtime,
     const jsi::Value &thisVal,
@@ -313,7 +408,8 @@ jsi::Value CDPAgentTest::shouldStop(
 void CDPAgentTest::sendRequest(
     const std::string &method,
     int id,
-    const std::function<void(::hermes::JSONEmitter &)> &setParameters) {
+    const std::function<void(::hermes::JSONEmitter &)> &setParameters,
+    CDPAgent *altAgent) {
   std::string command;
   llvh::raw_string_ostream commandStream{command};
   ::hermes::JSONEmitter json{commandStream};
@@ -328,7 +424,11 @@ void CDPAgentTest::sendRequest(
   }
   json.closeDict();
   commandStream.flush();
-  cdpAgent_->handleCommand(command);
+  if (altAgent != nullptr) {
+    altAgent->handleCommand(command);
+  } else {
+    cdpAgent_->handleCommand(command);
+  }
 }
 
 void CDPAgentTest::sendParameterlessRequest(const std::string &method, int id) {
@@ -361,10 +461,28 @@ void CDPAgentTest::waitForTestSignal(std::chrono::milliseconds timeout) {
   testSignalled_ = false;
 }
 
+jsi::Value CDPAgentTest::storeValue(
+    jsi::Runtime &runtime,
+    const jsi::Value &thisVal,
+    const jsi::Value *args,
+    size_t count) {
+  if (count > 0) {
+    std::unique_lock<std::mutex> lock(storedValueMutex_);
+    storedValue_ = jsi::Value(runtime, args[0]);
+  }
+  return jsi::Value::undefined();
+}
+
+jsi::Value CDPAgentTest::takeStoredValue() {
+  std::unique_lock<std::mutex> lock(storedValueMutex_);
+  return std::move(storedValue_);
+}
+
 void CDPAgentTest::sendEvalRequest(
     int id,
     int callFrameId,
-    const std::string &expression) {
+    const std::string &expression,
+    CDPAgent *altAgent) {
   std::string command;
   llvh::raw_string_ostream commandStream{command};
   ::hermes::JSONEmitter json{commandStream};
@@ -379,22 +497,26 @@ void CDPAgentTest::sendEvalRequest(
   json.closeDict();
   json.closeDict();
   commandStream.flush();
-  cdpAgent_->handleCommand(command);
+  if (altAgent != nullptr) {
+    altAgent->handleCommand(command);
+  } else {
+    cdpAgent_->handleCommand(command);
+  }
 }
 
-std::unordered_map<std::string, std::string> CDPAgentTest::getAndEnsureProps(
+m::runtime::GetPropertiesResponse CDPAgentTest::getAndEnsureProps(
     int msgId,
     const std::string &objectId,
     const std::unordered_map<std::string, PropInfo> &infos,
-    bool ownProperties) {
-  sendRequest(
-      "Runtime.getProperties",
-      msgId,
-      [objectId, ownProperties](::hermes::JSONEmitter &json) {
-        json.emitKeyValue("objectId", objectId);
-        json.emitKeyValue("ownProperties", ownProperties);
-      });
-  return ensureProps(waitForMessage(), infos);
+    const std::unordered_map<std::string, PropInfo> &internalInfos,
+    bool ownProperties,
+    bool accessorPropertiesOnly) {
+  sendRequest("Runtime.getProperties", msgId, [&](::hermes::JSONEmitter &json) {
+    json.emitKeyValue("objectId", objectId);
+    json.emitKeyValue("ownProperties", ownProperties);
+    json.emitKeyValue("accessorPropertiesOnly", accessorPropertiesOnly);
+  });
+  return ensureProps(waitForMessage(), infos, internalInfos);
 }
 
 TEST_F(CDPAgentTest, CDPAgentIssuesStartupTask) {
@@ -705,6 +827,29 @@ TEST_F(CDPAgentTest, DebuggerEnableWhenAlreadyPaused) {
   ensureNotification(waitForMessage("Debugger.resumed"), "Debugger.resumed");
 }
 
+TEST_F(CDPAgentTest, DebuggerCallFrameThisType) {
+  int msgId = 1;
+  sendAndCheckResponse("Debugger.enable", msgId++);
+
+  // Trigger a debugger pause where one of the call frames has an undefined
+  // 'this'
+  scheduleScript(R"(
+    function test() {
+      debugger;           // line 2
+    }
+    test.call(undefined); // line 4 - Call test() with an undefined 'this'
+  )");
+
+  ensureNotification(waitForMessage(), "Debugger.scriptParsed");
+
+  // Verify that the 'this' RemoteObject is populated correctedly.
+  ensurePaused(
+      waitForMessage(),
+      "other",
+      {FrameInfo("0", "test", 2, 2).setThisType("undefined"),
+       FrameInfo("2", "global", 4, 1).setThisType("object")});
+}
+
 TEST_F(CDPAgentTest, DebuggerScriptsOrdering) {
   int msgId = 1;
   std::vector<std::string> notifications;
@@ -814,6 +959,47 @@ TEST_F(CDPAgentTest, DebuggerTestDebuggerStatement) {
 
   // [1] (line 2) hit debugger statement, resume
   ensurePaused(waitForMessage(), "other", {{"global", 2, 1}});
+  sendAndCheckResponse("Debugger.resume", msgId++);
+  ensureNotification(waitForMessage(), "Debugger.resumed");
+}
+
+TEST_F(CDPAgentTest, DebuggerFiltersNativeFrames) {
+  int msgId = 1;
+
+  sendAndCheckResponse("Debugger.enable", msgId++);
+
+  // `debugger;` statement won't work unless Debugger domain is enabled, so
+  // call `scheduleScript()` after sending `Debugger.enable`.
+  scheduleScript(R"(
+    function level4() {
+      debugger;             // line 2
+    }
+    function level3() {
+      // This inserts a native frame due to calling via hermesBuiltinApply
+      level4(...arguments); // line 6
+    }
+    function level2() {
+      // This inserts a native frame due to calling via functionPrototypeApply
+      level3.apply();       // line 10
+    }
+    function level1() {
+      // This inserts a native frame due to calling via functionPrototypeCall
+      level2.call();        // line 14
+    }
+    level1();               // line 16
+  )");
+  ensureNotification(waitForMessage(), "Debugger.scriptParsed");
+
+  // Check that no native frames are emitted. The Debugger.CallFrameId won't be
+  // sequential.
+  ensurePaused(
+      waitForMessage(),
+      "other",
+      {{"0", "level4", 2, 2},
+       {"2", "level3", 6, 2},
+       {"4", "level2", 10, 2},
+       {"6", "level1", 14, 2},
+       {"7", "global", 16, 1}});
   sendAndCheckResponse("Debugger.resume", msgId++);
   ensureNotification(waitForMessage(), "Debugger.resumed");
 }
@@ -1014,6 +1200,42 @@ TEST_F(CDPAgentTest, DebuggerSetPauseOnExceptionsAll) {
   EXPECT_EQ(thrownExceptions_.back(), "Uncaught exception");
 }
 
+TEST_F(CDPAgentTest, DebuggerReportsException) {
+  int msgId = 1;
+
+  sendAndCheckResponse("Debugger.enable", msgId++);
+
+  scheduleScript(R"(
+    debugger; // [1] (line 1) initial pause, set throw on exceptions to 'All'
+    throw new Error('Catch me if you can'); // [2] (line 2) pause on exception
+  )");
+  ensureNotification(waitForMessage(), "Debugger.scriptParsed");
+
+  // [1] (line 1) initial pause. set throw on exceptions to 'All' then resume.
+  ensurePaused(waitForMessage(), "other", {{"global", 1, 1}});
+  sendRequest(
+      "Debugger.setPauseOnExceptions", msgId, [](::hermes::JSONEmitter &json) {
+        json.emitKeyValue("state", "all");
+      });
+  ensureOkResponse(waitForMessage(), msgId++);
+  sendAndCheckResponse("Debugger.resume", msgId++);
+  ensureNotification(waitForMessage(), "Debugger.resumed");
+
+  // [2] line 2, pause on exception, ensure exception details arrived.
+  m::debugger::PausedNotification note =
+      ensurePaused(waitForMessage(), "exception", {{"global", 2, 1}});
+  EXPECT_TRUE(note.data.has_value());
+  JSONObject *data = jsonScope_.parseObject(*note.data);
+  EXPECT_EQ(
+      jsonScope_.getString(data, {"description"}),
+      "Error: Catch me if you can");
+
+  // Let the script finish
+  sendAndCheckResponse("Debugger.resume", msgId++);
+  ensureNotification(waitForMessage(), "Debugger.resumed");
+  waitForScheduledScripts();
+}
+
 TEST_F(CDPAgentTest, DebuggerEvalOnCallFrame) {
   int msgId = 1;
 
@@ -1114,8 +1336,8 @@ TEST_F(CDPAgentTest, DebuggerEvalOnCallFrame) {
       objectId,
       {{"number", PropInfo("number").setValue("1")},
        {"bool", PropInfo("boolean").setValue("false")},
-       {"str", PropInfo("string").setValue("\"string\"")},
-       {"__proto__", PropInfo("object")}});
+       {"str", PropInfo("string").setValue("\"string\"")}},
+      {{"[[Prototype]]", PropInfo("object")}});
 
   // [3] resume
   sendAndCheckResponse("Debugger.resume", msgId++);
@@ -1740,6 +1962,60 @@ TEST_F(CDPAgentTest, DebuggerActivateBreakpoints) {
   ensureNotification(waitForMessage(), "Debugger.resumed");
 }
 
+TEST_F(CDPAgentTest, DebuggerMultipleCDPAgents) {
+  // Make a second CDPAgent
+  auto secondCDPAgent = CDPAgent::create(
+      kTestExecutionContextId_,
+      *cdpDebugAPI_,
+      std::bind(&CDPAgentTest::handleRuntimeTask, this, _1),
+      std::bind(&CDPAgentTest::handleResponse, this, _1));
+
+  int msgId = 1;
+
+  sendAndCheckResponse("Debugger.enable", msgId++);
+
+  std::array<std::string, 4> secondAgentMethods = {
+      "Debugger.resume",
+      "Debugger.stepOver",
+      "Debugger.stepInto",
+      "Debugger.stepOut",
+  };
+
+  for (const auto &method : secondAgentMethods) {
+    scheduleScript(R"(
+      debugger;      // line 1
+    )");
+    ensureNotification(waitForMessage(), "Debugger.scriptParsed");
+    ensurePaused(waitForMessage(), "other", {{"global", 1, 1}});
+
+    // Send a command from the second CDPAgent even though we never enabled the
+    // Debugger domain on the second one.
+    sendRequest(method, msgId, {}, secondCDPAgent.get());
+
+    // Check that the command gets processed successfully
+    ensureOkResponse(waitForMessage(), msgId++);
+
+    // And the debugger resumed
+    ensureNotification(waitForMessage(), "Debugger.resumed");
+  }
+
+  scheduleScript(R"(
+    function level1() {
+      var foo = "bar";
+      debugger;        // line 3
+    }
+    level1();
+  )");
+  ensureNotification(waitForMessage(), "Debugger.scriptParsed");
+  ensurePaused(waitForMessage(), "other", {{"level1", 3, 2}, {"global", 5, 1}});
+
+  // Send a command from the second CDPAgent for evaluateOnCallFrame even though
+  // we never enabled the Debugger domain on the second one.
+  sendEvalRequest(msgId, 0, R"("foo" + foo)", secondCDPAgent.get());
+
+  ensureEvalResponse(waitForMessage(), msgId++, "foobar");
+}
+
 TEST_F(CDPAgentTest, RuntimeEnableDisable) {
   int msgId = 1;
 
@@ -1806,10 +2082,12 @@ TEST_F(CDPAgentTest, RuntimeGetHeapUsage) {
   // getHeapUsage response does not include the method name
   auto resp = expectResponse(std::nullopt, msgId++);
 
-  // Some memory should be in use. We don't know how much, but it should be
-  // more than 0.
-  EXPECT_GT(jsonScope_.getNumber(resp, {"result", "usedSize"}), 0);
-  EXPECT_GT(jsonScope_.getNumber(resp, {"result", "totalSize"}), 0);
+  // Some GC configurations report zero memory usage (e.g. mallocgc).
+  // Expect a successful response with non-negative memory usage,
+  // accepting zero memory usage rather than baking the specifics
+  // of each GC into this test of CDP.
+  EXPECT_GE(jsonScope_.getNumber(resp, {"result", "usedSize"}), 0);
+  EXPECT_GE(jsonScope_.getNumber(resp, {"result", "totalSize"}), 0);
 }
 
 TEST_F(CDPAgentTest, RuntimeGlobalLexicalScopeNames) {
@@ -1968,30 +2246,33 @@ TEST_F(CDPAgentTest, RuntimeGetProperties) {
   std::string scopeObjId = scopeObj.objectId.value();
   objIds.push_back(scopeObjId);
 
-  auto scopeChildren = getAndEnsureProps(
+  auto scopeChildrenResp = getAndEnsureProps(
       msgId++,
       scopeObjId,
-      {{"this", PropInfo("undefined")},
-       {"num", PropInfo("number").setValue("123")},
+      {{"num", PropInfo("number").setValue("123")},
        {"obj", PropInfo("object")},
        {"arr", PropInfo("object").setSubtype("array")},
        {"bar", PropInfo("function")}});
-  EXPECT_EQ(scopeChildren.size(), 3);
+  auto scopeChildren = indexProps(scopeChildrenResp.result);
+  EXPECT_EQ(scopeChildren.size(), 4);
 
-  EXPECT_EQ(scopeChildren.count("obj"), 1);
-  std::string objId = scopeChildren.at("obj");
+  ASSERT_EQ(scopeChildren.count("obj"), 1);
+  const auto &obj = scopeChildren.at("obj");
+  std::string objId = obj.value.value().objectId.value();
   objIds.push_back(objId);
 
-  auto objChildren = getAndEnsureProps(
+  auto objChildrenResp = getAndEnsureProps(
       msgId++,
       objId,
       {{"depth", PropInfo("number").setValue("0")},
-       {"value", PropInfo("object")},
-       {"__proto__", PropInfo("object")}});
+       {"value", PropInfo("object")}},
+      {{"[[Prototype]]", PropInfo("object")}});
+  auto objChildren = indexProps(objChildrenResp.result);
   EXPECT_EQ(objChildren.size(), 2);
 
-  EXPECT_EQ(objChildren.count("value"), 1);
-  std::string valueId = objChildren.at("value");
+  ASSERT_EQ(objChildren.count("value"), 1);
+  const auto &value = objChildren.at("value");
+  std::string valueId = value.value.value().objectId.value();
   objIds.push_back(valueId);
 
   auto valueChildren = getAndEnsureProps(
@@ -2001,9 +2282,9 @@ TEST_F(CDPAgentTest, RuntimeGetProperties) {
        {"b", PropInfo("number").setUnserializableValue("Infinity")},
        {"c", PropInfo("number").setUnserializableValue("NaN")},
        {"d", PropInfo("number").setUnserializableValue("-0")},
-       {"e", PropInfo("string").setValue("\"e_string\"")},
-       {"__proto__", PropInfo("object")}});
-  EXPECT_EQ(valueChildren.size(), 1);
+       {"e", PropInfo("string").setValue("\"e_string\"")}},
+      {{"[[Prototype]]", PropInfo("object")}});
+  EXPECT_EQ(valueChildren.result.size(), 5);
 
   sendAndCheckResponse("Debugger.resume", msgId++);
   ensureNotification(waitForMessage(), "Debugger.resumed");
@@ -2028,11 +2309,12 @@ TEST_F(CDPAgentTest, RuntimeGetPropertiesOnlyOwn) {
   sendAndCheckResponse("Debugger.enable", msgId++);
   scheduleScript(R"(
     function foo() {
-      var protoObject = {
-        "protoNum": 77
-      };
+      var protoObject = Object.create(null);
+      protoObject.protoNum = 77;
+
       var obj = Object.create(protoObject);
       obj.num = 42;
+      protoObject.num = 1234 /* shadowed */;
       debugger;
     }
     foo();
@@ -2042,36 +2324,149 @@ TEST_F(CDPAgentTest, RuntimeGetPropertiesOnlyOwn) {
   // wait for a pause on debugger statement and get object ID from the local
   // scope.
   auto pausedNote = ensurePaused(
-      waitForMessage(), "other", {{"foo", 7, 2}, {"global", 9, 1}});
+      waitForMessage(), "other", {{"foo", 8, 2}, {"global", 10, 1}});
   const auto &scopeObject = pausedNote.callFrames.at(0).scopeChain.at(0).object;
-  auto scopeChildren = getAndEnsureProps(
+  auto scopeChildrenResp = getAndEnsureProps(
       msgId++,
       scopeObject.objectId.value(),
-      {{"this", PropInfo("undefined")},
-       {"obj", PropInfo("object")},
-       {"protoObject", PropInfo("object")}});
+      {{"obj", PropInfo("object")}, {"protoObject", PropInfo("object")}});
+  auto scopeChildren = indexProps(scopeChildrenResp.result);
   EXPECT_EQ(scopeChildren.count("obj"), 1);
-  std::string objId = scopeChildren.at("obj");
+  const auto &obj = scopeChildren.at("obj");
+  std::string objId = obj.value.value().objectId.value();
 
   // Check that GetProperties request for obj object only have own properties
   // when onlyOwnProperties = true.
   getAndEnsureProps(
       msgId++,
       objId,
-      {{"num", PropInfo("number").setValue("42")},
-       {"__proto__", PropInfo("object")}},
+      {{"num", PropInfo("number").setValue("42")}},
+      {{"[[Prototype]]", PropInfo("object")}},
       true);
 
   // Check that GetProperties request for obj object only have all properties
   // when onlyOwnProperties = false.
-  // __proto__ is not returned here because all properties from proto chain
-  // are already included in the result.
   getAndEnsureProps(
       msgId++,
       objId,
       {{"num", PropInfo("number").setValue("42")},
        {"protoNum", PropInfo("number").setValue("77")}},
+      {{"[[Prototype]]", PropInfo("object")}},
       false);
+
+  ASSERT_EQ(scopeChildren.count("protoObject"), 1);
+  std::string protoObjectId =
+      scopeChildren.at("protoObject").value.value().objectId.value();
+  getAndEnsureProps(
+      msgId++,
+      protoObjectId,
+      {{"num", PropInfo("number").setValue("1234")},
+       {"protoNum", PropInfo("number").setValue("77")}},
+      // No [[Prototype]] when the prototype is null
+      {});
+
+  // resume
+  sendAndCheckResponse("Debugger.resume", msgId++);
+  ensureNotification(waitForMessage(), "Debugger.resumed");
+}
+
+TEST_F(CDPAgentTest, RuntimeGetPropertiesExtendedDescriptors) {
+  int msgId = 1;
+
+  // Start a script
+  sendAndCheckResponse("Runtime.enable", msgId++);
+  sendAndCheckResponse("Debugger.enable", msgId++);
+  scheduleScript(R"(
+    function foo() {
+      var obj = Object.create(null);
+      Object.defineProperties(
+        obj,
+        {
+          data: {
+            value: 42,
+            configurable: false,
+            enumerable: false,
+            writable: false,
+          },
+          accessor: {
+            get() { return 1234; },
+            set(v) {},
+            configurable: true,
+            enumerable: false,
+          },
+          throwingAccessor: {
+            get() { throw new Error("Throwing accessor"); },
+          }
+        },
+      );
+      debugger;
+    }
+    foo();
+  )");
+  ensureNotification(waitForMessage(), "Debugger.scriptParsed");
+  auto pausedNote = ensurePaused(
+      waitForMessage(), "other", {{"foo", 23, 2}, {"global", 25, 1}});
+
+  const auto &scopeObject = pausedNote.callFrames.at(0).scopeChain.at(0).object;
+  EXPECT_TRUE(scopeObject.objectId.has_value());
+  std::string scopeObjectId = scopeObject.objectId.value();
+
+  auto scopeChildrenResp =
+      getAndEnsureProps(msgId++, scopeObjectId, {{"obj", PropInfo("object")}});
+  auto scopeChildren = indexProps(scopeChildrenResp.result);
+  ASSERT_EQ(scopeChildren.count("obj"), 1);
+  const auto &obj = scopeChildren.at("obj");
+  std::string objId = obj.value.value().objectId.value();
+
+  getAndEnsureProps(
+      msgId++,
+      objId,
+      {{"accessor", PropInfo().setConfigurable(true).setEnumerable(false)},
+       {"throwingAccessor",
+        PropInfo().setConfigurable(false).setEnumerable(false)}},
+      {},
+      /* ownProperties */ true,
+      /* accessorPropertiesOnly */ true);
+
+  auto objPropsResp = getAndEnsureProps(
+      msgId++,
+      objId,
+      {{"data",
+        PropInfo("number")
+            .setValue("42")
+            .setConfigurable(false)
+            .setEnumerable(false)
+            .setWritable(false)},
+       {"accessor", PropInfo().setConfigurable(true).setEnumerable(false)},
+       {"throwingAccessor",
+        PropInfo().setConfigurable(false).setEnumerable(false)}},
+      {},
+      /* ownProperties */ true,
+      /* accessorPropertiesOnly */ false);
+
+  /// Helper that invokes a getter function on the specified object.
+  auto invokeGetter = [&](std::string objId,
+                          const m::runtime::PropertyDescriptor &prop)
+      -> m::runtime::CallFunctionOnResponse {
+    m::runtime::CallFunctionOnRequest req;
+    req.id = msgId++;
+    req.functionDeclaration = kInvokeGetterFunction;
+    req.objectId = objId;
+    req.arguments = std::vector<m::runtime::CallArgument>{};
+    auto ca = m::runtime::CallArgument();
+    ca.objectId = prop.get.value().objectId.value();
+    req.arguments->push_back(std::move(ca));
+    cdpAgent_->handleCommand(serializeRuntimeCallFunctionOnRequest(req));
+    auto message = expectResponse(std::nullopt, req.id);
+    return mustMake<m::runtime::CallFunctionOnResponse>(message);
+  };
+
+  auto objProps = indexProps(objPropsResp.result);
+  EXPECT_EQ(
+      invokeGetter(objId, objProps.at("accessor")).result.value.value(),
+      "1234");
+  EXPECT_TRUE(invokeGetter(objId, objProps.at("throwingAccessor"))
+                  .exceptionDetails.has_value());
 
   // resume
   sendAndCheckResponse("Debugger.resume", msgId++);
@@ -2092,16 +2487,13 @@ TEST_F(CDPAgentTest, RuntimeEvaluate) {
     var booleanVar = true;
     var numberVar = 42;
     var objectVar = {number: 1, bool: false, str: "string"};
-
-    while(!shouldStop()) {  // [1] (line 6) hit infinite loop
-      var a = 1;            // [2] run evals
-      a++;                  // [3] exit run loop
-    }
   )");
+  // Wait for the script to execute
+  waitFor<bool>([this](auto promise) {
+    runtimeThread_->add([promise]() { promise->set_value(true); });
+  });
 
-  // [1] (line 6) hit infinite loop
-
-  // [2] run eval statements
+  // run eval statements
   sendRequest("Runtime.evaluate", msgId + 0, [](::hermes::JSONEmitter &params) {
     params.emitKeyValue("expression", R"("0: " + globalVar)");
   });
@@ -2111,7 +2503,7 @@ TEST_F(CDPAgentTest, RuntimeEvaluate) {
   EXPECT_EQ(
       jsonScope_.getString(resp0, {"result", "result", "value"}), "0: omega");
 
-  // [2.1] run eval statements that return non-string primitive values
+  // run eval statements that return non-string primitive values
   sendRequest("Runtime.evaluate", msgId + 1, [](::hermes::JSONEmitter &params) {
     params.emitKeyValue("expression", "booleanVar");
   });
@@ -2127,7 +2519,7 @@ TEST_F(CDPAgentTest, RuntimeEvaluate) {
       jsonScope_.getString(resp2, {"result", "result", "type"}), "number");
   EXPECT_EQ(jsonScope_.getNumber(resp2, {"result", "result", "value"}), 42);
 
-  // [2.2] run eval statement that returns object
+  // run eval statement that returns object
   sendRequest("Runtime.evaluate", msgId + 3, [](::hermes::JSONEmitter &params) {
     params.emitKeyValue("expression", "objectVar");
   });
@@ -2143,15 +2535,15 @@ TEST_F(CDPAgentTest, RuntimeEvaluate) {
       objId,
       {{"number", PropInfo("number").setValue("1")},
        {"bool", PropInfo("boolean").setValue("false")},
-       {"str", PropInfo("string").setValue("\"string\"")},
-       {"__proto__", PropInfo("object")}},
+       {"str", PropInfo("string").setValue("\"string\"")}},
+      {{"[[Prototype]]", PropInfo("object")}},
       true);
 }
 
 TEST_F(CDPAgentTest, RuntimeEvaluateWhilePaused) {
   int msgId = 1;
 
-  // Start a script
+  // Start a script that halts on a debugger statement
   sendAndCheckResponse("Runtime.enable", msgId++);
   sendAndCheckResponse("Debugger.enable", msgId++);
   scheduleScript(R"(
@@ -2162,45 +2554,36 @@ TEST_F(CDPAgentTest, RuntimeEvaluateWhilePaused) {
     })();
   )");
   expectNotification("Debugger.scriptParsed");
-
   auto pausedNote = ensurePaused(
       waitForMessage(), "other", {{"func", 4, 2}, {"global", 5, 1}});
 
-  // Evaluate the global variable; it should be visible to the runtime
-  // evaluation.
-  sendRequest("Runtime.evaluate", msgId, [](::hermes::JSONEmitter &params) {
-    params.emitKeyValue("expression", "inGlobalScope");
-  });
-  auto resp0 = expectResponse(std::nullopt, msgId++);
-  EXPECT_EQ(
-      jsonScope_.getString(resp0, {"result", "result", "type"}), "number");
-  EXPECT_EQ(jsonScope_.getNumber(resp0, {"result", "result", "value"}), 123);
-
-  // Evaluate the local variable; it should not be visible to the runtime
-  // evaluation.
-  sendRequest("Runtime.evaluate", msgId, [](::hermes::JSONEmitter &params) {
-    params.emitKeyValue("expression", "inFunctionScope");
-  });
-  auto resp1 = expectResponse(std::nullopt, msgId++);
-  EXPECT_GT(
-      jsonScope_.getString(resp1, {"result", "exceptionDetails", "text"})
-          .size(),
-      0);
+  // Runtime evaluate should not happen while paused.
+  int evaluateMsgId = msgId++;
+  sendRequest(
+      "Runtime.evaluate", evaluateMsgId, [](::hermes::JSONEmitter &params) {
+        params.emitKeyValue("expression", "inGlobalScope");
+      });
+  expectNothing();
 
   // Let the script terminate
-  sendAndCheckResponse("Debugger.resume", msgId++);
+  sendAndCheckResponse("Debugger.resume", msgId);
+  ensureNotification(waitForMessage("Debugger.resumed"), "Debugger.resumed");
+
+  // The eval should then complete, starting with a scriptParsed notification.
+  // Other tests of Runtime.evaluate don't receive the scriptParsed notification
+  // because they don't enable the debugger domain. This test is explicitly
+  // checking the behavior of Runtime.evaluate while paused, so the debugger
+  // domain is enabled.
+  expectNotification("Debugger.scriptParsed");
+  auto resp = expectResponse(std::nullopt, evaluateMsgId);
+  EXPECT_EQ(jsonScope_.getString(resp, {"result", "result", "type"}), "number");
+  EXPECT_EQ(jsonScope_.getNumber(resp, {"result", "result", "value"}), 123);
 }
 
 TEST_F(CDPAgentTest, RuntimeEvaluateReturnByValue) {
-  auto setStopFlag = llvh::make_scope_exit([this] {
-    // break out of loop
-    stopFlag_.store(true);
-  });
   int msgId = 1;
 
-  // Start a script
   sendAndCheckResponse("Runtime.enable", msgId++);
-  scheduleScript(R"(while(!shouldStop());)");
 
   // We expect this JSON object to be evaluated and return by value, so
   // that JSON encoding the result will give the same string.
@@ -2229,15 +2612,9 @@ TEST_F(CDPAgentTest, RuntimeEvaluateReturnByValue) {
 }
 
 TEST_F(CDPAgentTest, RuntimeEvaluateException) {
-  auto setStopFlag = llvh::make_scope_exit([this] {
-    // break out of loop
-    stopFlag_.store(true);
-  });
   int msgId = 1;
 
-  // Start a script
   sendAndCheckResponse("Runtime.enable", msgId++);
-  scheduleScript(R"(while(!shouldStop()) {})");
 
   // Evaluate something that throws
   sendRequest("Runtime.evaluate", msgId, [](::hermes::JSONEmitter &params) {
@@ -2256,6 +2633,10 @@ TEST_F(CDPAgentTest, RuntimeEvaluateException) {
       jsonScope_.getString(resp, {"result", "exceptionDetails", "text"}).size(),
       0);
 
+  // Ensure that the result object is populated with the exception as well
+  EXPECT_GT(
+      jsonScope_.getString(resp, {"result", "result", "objectId"}).size(), 0);
+
   // Evaluate something that isn't valid JavaScript syntax
   sendRequest("Runtime.evaluate", msgId, [](::hermes::JSONEmitter &params) {
     params.emitKeyValue("expression", R"(*ptr));)");
@@ -2269,16 +2650,45 @@ TEST_F(CDPAgentTest, RuntimeEvaluateException) {
       std::string::npos);
 }
 
+TEST_F(CDPAgentTest, RuntimeEvaluateNested) {
+  int msgId = 1;
+
+  sendAndCheckResponse("Runtime.enable", msgId++);
+
+  // Start a long-running expression
+  sendRequest("Runtime.evaluate", msgId + 0, [](::hermes::JSONEmitter &params) {
+    params.emitKeyValue("expression", R"(while(!shouldStop()); 1+1)");
+  });
+  // Expect it to keep running
+  expectNothing();
+
+  // Try to start another expression
+  sendRequest("Runtime.evaluate", msgId + 1, [](::hermes::JSONEmitter &params) {
+    params.emitKeyValue("expression", "2+2");
+  });
+  // Expect it to not be evaluated
+  expectNothing();
+
+  // Let the evaluations terminate
+  stopFlag_.store(true);
+
+  // Expect the first evaluation to complete first
+  auto resp0 = expectResponse(std::nullopt, msgId + 0);
+  EXPECT_EQ(
+      jsonScope_.getString(resp0, {"result", "result", "type"}), "number");
+  EXPECT_EQ(jsonScope_.getNumber(resp0, {"result", "result", "value"}), 2);
+
+  // Expect the second evaluation to complete second
+  auto resp1 = expectResponse(std::nullopt, msgId + 1);
+  EXPECT_EQ(
+      jsonScope_.getString(resp1, {"result", "result", "type"}), "number");
+  EXPECT_EQ(jsonScope_.getNumber(resp1, {"result", "result", "value"}), 4);
+}
+
 TEST_F(CDPAgentTest, RuntimeCallFunctionOnObject) {
   int msgId = 1;
 
-  // Start a script
   sendAndCheckResponse("Runtime.enable", msgId++);
-  sendAndCheckResponse("Debugger.enable", msgId++);
-  scheduleScript(R"(debugger;)");
-  expectNotification("Debugger.scriptParsed");
-
-  auto pausedNote = ensurePaused(waitForMessage(), "other", {{"global", 0, 1}});
 
   // create a new Object() that will be used as "this" below.
   m::runtime::RemoteObjectId thisId;
@@ -2295,9 +2705,6 @@ TEST_F(CDPAgentTest, RuntimeCallFunctionOnObject) {
   // expectedPropInfos are properties that are expected to exist in thisId.
   // It is modified by addMember (below).
   std::unordered_map<std::string, PropInfo> expectedPropInfos;
-
-  // Add __proto__ as it always exists.
-  expectedPropInfos.emplace("__proto__", PropInfo("object"));
 
   /// addMember sends Runtime.callFunctionOn() requests with a function
   /// declaration that simply adds a new property called \p propName with
@@ -2348,14 +2755,18 @@ TEST_F(CDPAgentTest, RuntimeCallFunctionOnObject) {
   /// runtime::RemoteObjectId for the "self_ref" property (which must exist).
   auto verifyObjShape = [&](const m::runtime::RemoteObjectId &objId)
       -> std::optional<std::string> {
-    auto objProps = getAndEnsureProps(msgId++, objId, expectedPropInfos);
-    EXPECT_TRUE(objProps.count("__proto__"));
+    auto objPropsResponse = getAndEnsureProps(
+        msgId++,
+        objId,
+        expectedPropInfos,
+        {{"[[Prototype]]", PropInfo("object")}});
+    auto objProps = indexProps(objPropsResponse.result);
     auto objPropIt = objProps.find("self_ref");
     if (objPropIt == objProps.end()) {
       EXPECT_TRUE(false) << "missing \"self_ref\" property.";
       return {};
     }
-    return objPropIt->second;
+    return objPropIt->second.value.value().objectId.value();
   };
 
   // Verify that thisId has the correct shape.
@@ -2382,20 +2793,41 @@ TEST_F(CDPAgentTest, RuntimeCallFunctionOnObject) {
       *selfRefId, "number", "neg_zero", makeUnserializableCallArgument("-0"));
 
   verifyObjShape(thisId);
+}
 
-  // Let the script terminate
-  sendAndCheckResponse("Debugger.resume", msgId++);
+TEST_F(CDPAgentTest, RuntimeCallFunctionOnScope) {
+  int msgId = 1;
+
+  sendAndCheckResponse("Runtime.enable", msgId++);
+  sendAndCheckResponse("Debugger.enable", msgId++);
+
+  scheduleScript(R"(
+    function test() {
+      debugger;  // line 2
+    }
+    test();      // line 4
+  )");
+
+  ensureNotification(waitForMessage(), "Debugger.scriptParsed");
+
+  m::debugger::PausedNotification note = ensurePaused(
+      waitForMessage(), "other", {{"test", 2, 2}, {"global", 4, 1}});
+  EXPECT_EQ(note.callFrames[0].scopeChain.size(), 2);
+  EXPECT_EQ(note.callFrames[0].scopeChain[0].object.objectId.value(), "-1");
+
+  m::runtime::CallFunctionOnRequest req;
+  req.id = msgId;
+  req.functionDeclaration = std::string("function(){}");
+  req.objectId = "-1";
+
+  cdpAgent_->handleCommand(serializeRuntimeCallFunctionOnRequest(req));
+  expectResponse(std::nullopt, msgId++);
 }
 
 TEST_F(CDPAgentTest, RuntimeCallFunctionOnExecutionContext) {
   int msgId = 1;
 
-  // Start a script
   sendAndCheckResponse("Runtime.enable", msgId++);
-  sendAndCheckResponse("Debugger.enable", msgId++);
-  scheduleScript(R"(debugger;)");
-  expectNotification("Debugger.scriptParsed");
-  auto pausedNote = ensurePaused(waitForMessage(), "other", {{"global", 0, 1}});
 
   /// helper that returns a map with all of \p objId 's members.
   auto getProps = [this, &msgId](const m::runtime::RemoteObjectId &objId) {
@@ -2498,9 +2930,36 @@ TEST_F(CDPAgentTest, RuntimeCallFunctionOnExecutionContext) {
       }
     }
   }
+}
 
-  // Let the script terminate
-  sendAndCheckResponse("Debugger.resume", msgId++);
+TEST_F(CDPAgentTest, RuntimeCallFunctionOnExecutionContextThrowingError) {
+  int msgId = 1;
+
+  sendAndCheckResponse("Runtime.enable", msgId++);
+
+  m::runtime::CallFunctionOnRequest req;
+  req.id = msgId;
+  // This function will throw an error when called, so we expect the inspector
+  // to return a Runtime.ExceptionThrown notification with this message.
+  req.functionDeclaration = "() => {throw new Error('test')}";
+  req.executionContextId = kTestExecutionContextId_;
+  cdpAgent_->handleCommand(serializeRuntimeCallFunctionOnRequest(req));
+
+  auto resp = expectResponse(std::nullopt, msgId++);
+  // Ensure the exception (remote) object and text were delivered
+  EXPECT_GT(
+      jsonScope_
+          .getString(
+              resp, {"result", "exceptionDetails", "exception", "objectId"})
+          .size(),
+      0);
+  EXPECT_GT(
+      jsonScope_.getString(resp, {"result", "exceptionDetails", "text"}).size(),
+      0);
+
+  // Ensure that the result object is populated with the exception as well
+  EXPECT_GT(
+      jsonScope_.getString(resp, {"result", "result", "objectId"}).size(), 0);
 }
 
 TEST_F(CDPAgentTest, RuntimeConsoleLog) {
@@ -2508,36 +2967,71 @@ TEST_F(CDPAgentTest, RuntimeConsoleLog) {
   constexpr double kTimestamp = 123.0;
   const std::string kStringValue = "string value";
 
-  // Startup
-  sendAndCheckResponse("Runtime.enable", msgId++);
-
-  // Generate message
   waitFor<bool>([this, timestamp = kTimestamp, kStringValue](auto promise) {
     runtimeThread_->add([this, timestamp, kStringValue, promise]() {
-      jsi::String arg0 = jsi::String::createFromAscii(*runtime_, kStringValue);
+      runtime_->global().setProperty(
+          *runtime_,
+          "consoleLog",
+          jsi::Function::createFromHostFunction(
+              *runtime_,
+              jsi::PropNameID::forAscii(*runtime_, "consoleLog"),
+              0,
+              [this, timestamp, kStringValue](
+                  jsi::Runtime &,
+                  const jsi::Value &,
+                  const jsi::Value *,
+                  size_t) {
+                jsi::String arg0 =
+                    jsi::String::createFromAscii(*runtime_, kStringValue);
 
-      jsi::Object arg1 = jsi::Object(*runtime_);
-      arg1.setProperty(*runtime_, "number1", 1);
-      arg1.setProperty(*runtime_, "bool1", false);
+                jsi::Object arg1 = jsi::Object(*runtime_);
+                arg1.setProperty(*runtime_, "number1", 1);
+                arg1.setProperty(*runtime_, "bool1", false);
 
-      jsi::Object arg2 = jsi::Object(*runtime_);
-      arg2.setProperty(*runtime_, "number2", 2);
-      arg2.setProperty(*runtime_, "bool2", true);
+                jsi::Object arg2 = jsi::Object(*runtime_);
+                arg2.setProperty(*runtime_, "number2", 2);
+                arg2.setProperty(*runtime_, "bool2", true);
 
-      ConsoleMessage message(
-          timestamp, ConsoleAPIType::kWarning, std::vector<jsi::Value>());
-      message.args.reserve(3);
-      message.args.push_back(std::move(arg0));
-      message.args.push_back(std::move(arg1));
-      message.args.push_back(std::move(arg2));
-      cdpDebugAPI_->addConsoleMessage(std::move(message));
+                ConsoleMessage message(
+                    timestamp,
+                    ConsoleAPIType::kWarning,
+                    std::vector<jsi::Value>());
+                message.args.reserve(3);
+                message.args.push_back(std::move(arg0));
+                message.args.push_back(std::move(arg1));
+                message.args.push_back(std::move(arg2));
+                message.stackTrace =
+                    runtime_->getDebugger().captureStackTrace();
+                cdpDebugAPI_->addConsoleMessage(std::move(message));
 
+                return jsi::Value::undefined();
+              }));
       promise->set_value(true);
     });
   });
 
+  // Startup
+  sendAndCheckResponse("Runtime.enable", msgId++);
+
+  // Generate message
+  sendRequest("Runtime.evaluate", msgId, [](::hermes::JSONEmitter &params) {
+    params.emitKeyValue("expression", R"(
+      function level2() {
+        consoleLog();
+      }
+      function level1() {
+        // This creates a native frame due to executing via hermesBuiltinApply
+        level2(...arguments);
+      }
+      level1();
+    )");
+  });
+
   // Validate notification
   auto note = expectNotification("Runtime.consoleAPICalled");
+
+  // Runtime.evaluate's response comes after the consoleAPICalled notification
+  expectResponse(std::nullopt, msgId++);
 
   EXPECT_EQ(jsonScope_.getNumber(note, {"params", "timestamp"}), kTimestamp);
   EXPECT_EQ(
@@ -2553,6 +3047,22 @@ TEST_F(CDPAgentTest, RuntimeConsoleLog) {
       jsonScope_.getString(note, {"params", "args", "0", "value"}),
       kStringValue);
 
+  auto callFrames =
+      jsonScope_.getArray(note, {"params", "stackTrace", "callFrames"});
+  EXPECT_EQ(callFrames->size(), 3);
+  EXPECT_EQ(
+      jsonScope_.getString(
+          note, {"params", "stackTrace", "callFrames", "0", "functionName"}),
+      "level2");
+  EXPECT_EQ(
+      jsonScope_.getString(
+          note, {"params", "stackTrace", "callFrames", "1", "functionName"}),
+      "level1");
+  EXPECT_EQ(
+      jsonScope_.getString(
+          note, {"params", "stackTrace", "callFrames", "2", "functionName"}),
+      "global");
+
   EXPECT_EQ(
       jsonScope_.getString(note, {"params", "args", "1", "type"}), "object");
   std::string object1ID =
@@ -2561,8 +3071,8 @@ TEST_F(CDPAgentTest, RuntimeConsoleLog) {
       msgId++,
       object1ID,
       {{"number1", PropInfo("number").setValue("1")},
-       {"bool1", PropInfo("boolean").setValue("false")},
-       {"__proto__", PropInfo("object")}});
+       {"bool1", PropInfo("boolean").setValue("false")}},
+      {{"[[Prototype]]", PropInfo("object")}});
 
   EXPECT_EQ(
       jsonScope_.getString(note, {"params", "args", "2", "type"}), "object");
@@ -2572,8 +3082,38 @@ TEST_F(CDPAgentTest, RuntimeConsoleLog) {
       msgId++,
       object2ID,
       {{"number2", PropInfo("number").setValue("2")},
-       {"bool2", PropInfo("boolean").setValue("true")},
-       {"__proto__", PropInfo("object")}});
+       {"bool2", PropInfo("boolean").setValue("true")}},
+      {{"[[Prototype]]", PropInfo("object")}});
+}
+
+TEST_F(CDPAgentTest, RuntimeConsoleLogJSON) {
+  int msgId = 1;
+  const std::string kStringValue = "{\"number\": 1}";
+
+  // Startup
+  sendAndCheckResponse("Runtime.enable", msgId++);
+
+  // Generate ConsoleAPICalled notification containing a JSON string argument
+  waitFor<bool>([this, kStringValue](auto promise) {
+    runtimeThread_->add([this, promise, kStringValue]() {
+      constexpr double kTimestamp = 123.0;
+      jsi::String arg = jsi::String::createFromAscii(*runtime_, kStringValue);
+      ConsoleMessage message(
+          kTimestamp, ConsoleAPIType::kWarning, std::vector<jsi::Value>());
+      message.args.push_back(std::move(arg));
+      cdpDebugAPI_->addConsoleMessage(std::move(message));
+      promise->set_value(true);
+    });
+  });
+  auto note = expectNotification("Runtime.consoleAPICalled");
+
+  // Ensure the JSON arrived intact
+  EXPECT_EQ(jsonScope_.getArray(note, {"params", "args"})->size(), 1);
+  EXPECT_EQ(
+      jsonScope_.getString(note, {"params", "args", "0", "type"}), "string");
+  EXPECT_EQ(
+      jsonScope_.getString(note, {"params", "args", "0", "value"}),
+      kStringValue);
 }
 
 TEST_F(CDPAgentTest, RuntimeConsoleBuffer) {
@@ -2656,6 +3196,28 @@ TEST_F(CDPAgentTest, RuntimeConsoleBuffer) {
   }
 }
 
+TEST_F(CDPAgentTest, RuntimeDiscardConsoleEntries) {
+  int msgId = 1;
+
+  sendAndCheckResponse("Runtime.enable", msgId++);
+
+  waitFor<bool>([this](auto promise) {
+    runtimeThread_->add([this, promise]() {
+      cdpDebugAPI_->addConsoleMessage(
+          ConsoleMessage{0.0, ConsoleAPIType::kLog, std::vector<jsi::Value>()});
+      promise->set_value(true);
+    });
+  });
+
+  expectNotification("Runtime.consoleAPICalled");
+
+  sendAndCheckResponse("Runtime.discardConsoleEntries", msgId++);
+  sendAndCheckResponse("Runtime.disable", msgId++);
+  sendAndCheckResponse("Runtime.enable", msgId++);
+
+  expectNothing();
+}
+
 TEST_F(CDPAgentTest, ProfilerBasicOperation) {
   auto setStopFlag = llvh::make_scope_exit([this] {
     // break out of loop
@@ -2693,16 +3255,9 @@ TEST_F(CDPAgentTest, ProfilerBasicOperation) {
 }
 
 TEST_F(CDPAgentTest, RuntimeValidatesExecutionContextId) {
-  auto setStopFlag = llvh::make_scope_exit([this] {
-    // break out of loop
-    stopFlag_.store(true);
-  });
-
   int msgId = 1;
 
-  // Start a script
   sendAndCheckResponse("Runtime.enable", msgId++);
-  scheduleScript(R"(while(!shouldStop());)");
 
   constexpr auto kExecutionContextSubstring = "execution context id";
 
@@ -2734,6 +3289,249 @@ TEST_F(CDPAgentTest, RuntimeValidatesExecutionContextId) {
   req.executionContextId = kTestExecutionContextId_ + 1;
   cdpAgent_->handleCommand(serializeRuntimeCallFunctionOnRequest(req));
   expectErrorMessageContaining(kExecutionContextSubstring, msgId++);
+}
+
+TEST_F(CDPAgentTest, HeapProfilerSnapshot) {
+  auto setStopFlag = llvh::make_scope_exit([this] {
+    // break out of loop
+    stopFlag_.store(true);
+  });
+
+  int msgId = 1;
+
+  scheduleScript(R"(
+      while(!shouldStop());
+  )");
+
+  // Request a heap snapshot and expect it to arrive.
+  sendRequest(
+      "HeapProfiler.takeHeapSnapshot", msgId, [](::hermes::JSONEmitter &json) {
+        json.emitKeyValue("reportProgress", false);
+      });
+  expectHeapSnapshot(msgId);
+
+  // Expect no more chunks are pending.
+  expectNothing();
+}
+
+TEST_F(CDPAgentTest, HeapProfilerSnapshotRemoteObject) {
+  int msgId = 1;
+  scheduleScript(R"(
+    storeValue([1, 2, 3]);
+    signalTest();
+  )");
+  waitForTestSignal();
+
+  {
+    // Take a heap snapshot first to assign IDs.
+    sendRequest(
+        "HeapProfiler.takeHeapSnapshot",
+        msgId,
+        [](::hermes::JSONEmitter &json) {
+          json.emitKeyValue("reportProgress", false);
+        });
+    // We don't need to keep the response because we can directly query for
+    // object IDs from the runtime.
+    expectHeapSnapshot(msgId++);
+  }
+
+  const uint64_t globalObjID = runtime_->getUniqueID(runtime_->global());
+  jsi::Value storedValue = takeStoredValue();
+  const uint64_t storedObjID =
+      runtime_->getUniqueID(storedValue.asObject(*runtime_));
+
+  auto testObject = [this, &msgId](
+                        uint64_t objID,
+                        const char *type,
+                        const char *className,
+                        const char *description,
+                        const char *subtype) {
+    // Get the object by its snapshot ID.
+    sendRequest(
+        "HeapProfiler.getObjectByHeapObjectId",
+        msgId,
+        [objID](::hermes::JSONEmitter &json) {
+          json.emitKeyValue("objectId", std::to_string(objID));
+        });
+    auto resp0 = expectResponse(std::nullopt, msgId++);
+    EXPECT_EQ(jsonScope_.getString(resp0, {"result", "result", "type"}), type);
+    EXPECT_EQ(
+        jsonScope_.getString(resp0, {"result", "result", "className"}),
+        className);
+    EXPECT_EQ(
+        jsonScope_.getString(resp0, {"result", "result", "description"}),
+        description);
+    if (subtype) {
+      EXPECT_EQ(
+          jsonScope_.getString(resp0, {"result", "result", "subtype"}),
+          subtype);
+    }
+
+    // Check that fetching the object by heap snapshot ID works.
+    std::string responseObjectID =
+        jsonScope_.getString(resp0, {"result", "result", "objectId"});
+    sendRequest(
+        "HeapProfiler.getHeapObjectId",
+        msgId,
+        [responseObjectID](::hermes::JSONEmitter &json) {
+          json.emitKeyValue("objectId", responseObjectID);
+        });
+    auto resp1 = expectResponse(std::nullopt, msgId++);
+    EXPECT_EQ(
+        atoi(jsonScope_.getString(resp1, {"result", "heapSnapshotObjectId"})
+                 .c_str()),
+        objID);
+  };
+
+  // Test once before a collection.
+  testObject(globalObjID, "object", "Object", "Object", nullptr);
+  testObject(storedObjID, "object", "Array", "Array(3)", "array");
+
+  // Force a collection to move the heap.
+  waitFor<bool>([this](auto promise) {
+    runtimeThread_->add([this, promise]() {
+      runtime_->instrumentation().collectGarbage("test");
+      promise->set_value(true);
+    });
+  });
+
+  // A collection should not disturb the unique ID lookup, and it should be
+  // the same object as before. Note that it won't have the same remote ID,
+  // because Hermes doesn't do uniquing.
+  testObject(globalObjID, "object", "Object", "Object", nullptr);
+  testObject(storedObjID, "object", "Array", "Array(3)", "array");
+}
+
+TEST_F(CDPAgentTest, HeapProfilerCollectGarbage) {
+  int msgId = 1;
+
+  // Allocate some objects
+  scheduleScript(R"(
+    a = [];
+    for (var i = 0; i < 1000; i++) {
+      a[i] = new Object;
+    }
+  )");
+
+  // Get the heap usage with objects allocated
+  double before = waitFor<double>([this](auto promise) {
+    runtimeThread_->add([this, promise]() {
+      promise->set_value(runtime_->instrumentation().getHeapInfo(
+          false)["hermes_allocatedBytes"]);
+    });
+  });
+
+  // Abandon the objects
+  scheduleScript("a = null;");
+
+  // Collect garbage
+  sendAndCheckResponse("HeapProfiler.collectGarbage", msgId);
+
+  // Get the heap usage after collection
+  double after = waitFor<double>([this](auto promise) {
+    runtimeThread_->add([this, promise]() {
+      promise->set_value(runtime_->instrumentation().getHeapInfo(
+          false)["hermes_allocatedBytes"]);
+    });
+  });
+
+  // Expect objects to have been freed
+  EXPECT_LT(after, before);
+}
+
+TEST_F(CDPAgentTest, HeapProfilerTrackHeapObjects) {
+  int msgId = 1;
+
+  sendAndCheckResponse("HeapProfiler.startTrackingHeapObjects", msgId++);
+
+  // Allocate until we get a notification, or timeout
+  auto start = std::chrono::high_resolution_clock::now();
+  constexpr float timeout = 5.0f;
+  while (true) {
+    auto now = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<float> duration = now - start;
+    if (duration.count() >= timeout) {
+      // Timeout
+      break;
+    }
+
+    // Allocate some more
+    scheduleScript(R"(
+      a = a || []; // Ensure the array exists
+      for (var i = 0; i < 1000; i++) {
+        a.push(new Object);
+      }
+    )");
+    waitForScheduledScripts();
+
+    // Check to see if there is a report yet
+    auto objectIdNote = tryGetMessage();
+    if (objectIdNote) {
+      ensureNotification(*objectIdNote, "HeapProfiler.lastSeenObjectId");
+
+      auto statsNote = expectNotification("HeapProfiler.heapStatsUpdate");
+      double objectsCount =
+          jsonScope_.getNumber(statsNote, {"params", "statsUpdate", "1"});
+      double objectSize =
+          jsonScope_.getNumber(statsNote, {"params", "statsUpdate", "2"});
+      // Assuming zero-sized objects aren't present, the size of objects should
+      // be at least as large as the number of objects.
+      EXPECT_GE(objectSize, objectsCount);
+
+      // Verified that notifications are arriving; stop waiting.
+      break;
+    }
+  }
+
+  // Stop tracking, and expect a snapshot in summary (possibly with a few
+  // lingering tracking notifications first).
+  sendRequest("HeapProfiler.stopTrackingHeapObjects", msgId);
+  expectHeapSnapshot(msgId++, true /* ignore tracking notifications */);
+
+  // Expect no further responses or notifications.
+  expectNothing();
+}
+
+TEST_F(CDPAgentTest, HeapProfilerSampling) {
+  int msgId = 1;
+
+  // Start sampling.
+  {
+    sendRequest(
+        "HeapProfiler.startSampling", msgId, [](::hermes::JSONEmitter &json) {
+          // Sample every 256 bytes to ensure there are some samples. The
+          // default is 32768, which is too high for a small example. Note that
+          // sampling is a random process, so there's no guarantee there will be
+          // any samples in any finite number of allocations. In practice the
+          // likelihood is so high that there shouldn't be any issues.
+          json.emitKeyValue("samplingInterval", 256);
+        });
+    ensureOkResponse(waitForMessage(), msgId++);
+  }
+
+  // Run a script that allocates some objects.
+  scheduleScript(R"(
+      function allocator() {
+        // Do some allocation.
+        return new Object;
+      }
+      (function main() {
+        var a = [];
+        for (var i = 0; i < 1000; i++) {
+          a[i] = allocator();
+        }
+      })();
+    )");
+  waitForScheduledScripts();
+
+  // Stop sampling
+  sendRequest("HeapProfiler.stopSampling", msgId);
+  auto resp = expectResponse(std::nullopt, msgId++);
+  // Ensure the JSON parsed and some samples were produced.
+  EXPECT_NE(
+      jsonScope_.getArray(resp, {"result", "profile", "samples"})->size(), 0);
+  // Don't test the content of the JSON, that is tested via the
+  // SamplingHeapProfilerTest.
 }
 
 #endif // HERMES_ENABLE_DEBUGGER

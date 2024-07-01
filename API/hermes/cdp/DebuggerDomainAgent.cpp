@@ -283,8 +283,9 @@ void DebuggerDomainAgent::evaluateOnCallFrame(
   // Copy members of req before returning from this function.
   long long reqId = req.id;
   std::string objectGroup = req.objectGroup.value_or("");
-  bool byValue = req.returnByValue.value_or(false);
-  bool generatePreview = req.generatePreview.value_or(false);
+  ObjectSerializationOptions serializationOptions;
+  serializationOptions.returnByValue = req.returnByValue.value_or(false);
+  serializationOptions.generatePreview = req.generatePreview.value_or(false);
 
   uint32_t frameIndex = (uint32_t)atoi(req.callFrameId.c_str());
   asyncDebugger_.evalWhilePaused(
@@ -292,26 +293,24 @@ void DebuggerDomainAgent::evaluateOnCallFrame(
       frameIndex,
       [reqId,
        objectGroup = std::move(objectGroup),
-       byValue,
-       generatePreview,
+       serializationOptions = std::move(serializationOptions),
        this](HermesRuntime &runtime, const debugger::EvalResult &result) {
         m::debugger::EvaluateOnCallFrameResponse resp;
         resp.id = reqId;
         if (result.isException) {
-          resp.exceptionDetails =
-              m::runtime::makeExceptionDetails(result.exceptionDetails);
+          resp.exceptionDetails = m::runtime::makeExceptionDetails(
+              runtime, result, *objTable_, objectGroup);
+          // In V8, @cdp Debugger.evaluateOnCallFrame populates the `result`
+          // field with the exception value.
+          resp.result = m::runtime::makeRemoteObjectForError(
+              runtime, result.value, *objTable_, objectGroup);
         } else {
-          auto remoteObjPtr = std::make_shared<m::runtime::RemoteObject>();
-
-          *remoteObjPtr = m::runtime::makeRemoteObject(
+          resp.result = m::runtime::makeRemoteObject(
               runtime,
               result.value,
               *objTable_,
               objectGroup,
-              byValue,
-              generatePreview);
-
-          resp.result = std::move(*remoteObjPtr);
+              serializationOptions);
         }
         sendResponseToClient(resp);
       });
@@ -448,9 +447,47 @@ void DebuggerDomainAgent::sendPausedNotificationToClient(
     PausedNotificationReason reason) {
   m::debugger::PausedNotification note;
   switch (reason) {
-    case PausedNotificationReason::kException:
+    case PausedNotificationReason::kException: {
       note.reason = "exception";
-      break;
+
+      // Although the documentation lists the "data" field as optional for the
+      // @cdp Debugger.paused event:
+      // https://chromedevtools.github.io/devtools-protocol/tot/Debugger/#event-paused
+      // it is accessed unconditionally by the front-end when the pause reason
+      // is "exception". "data" is passed in as "auxData" via:
+      // https://github.com/facebookexperimental/rn-chrome-devtools-frontend/blob/9a23d4c7c4c2d1a3d9e913af38d6965f474c4284/front_end/core/sdk/DebuggerModel.ts#L994
+      // and "auxData" stored in a DebuggerPausedDetails instance:
+      // https://github.com/facebookexperimental/rn-chrome-devtools-frontend/blob/9a23d4c7c4c2d1a3d9e913af38d6965f474c4284/front_end/core/sdk/DebuggerModel.ts#L642
+      // which then has its fields accessed in:
+      // https://github.com/facebookexperimental/rn-chrome-devtools-frontend/blob/main/front_end/panels/sources/DebuggerPausedMessage.ts#L225
+      // If the "data" ("auxData") object is absent, accessing its fields will
+      // throw, breaking the display of pause information. Thus, we always
+      // populate "data" with an object. The "data" field has no schema in the
+      // protocol metadata that we use to generate message structures, so we
+      // need to manually construct a JSON object here. The structure expected
+      // by the front-end (specifically, the "description" field) can be
+      // inferred from the field access at the URL above. The front-end does
+      // gracefully handle missing fields on the "data" object, so we can
+      // consider the "description" field optional.
+      std::string data;
+      llvh::raw_string_ostream dataStream{data};
+      ::hermes::JSONEmitter dataJson{dataStream};
+      dataJson.openDict();
+
+      jsi::Value thrownValue = runtime_.getDebugger().getThrownValue();
+      if (!thrownValue.isUndefined()) {
+        std::string description = thrownValue.toString(runtime_).utf8(runtime_);
+        dataJson.emitKeyValue("description", description);
+      } else {
+        // No exception description to report, but emitting an empty "data"
+        // object will at least prevent the front-end from throwing.
+        assert(false && "Exception pause missing thrown value");
+      }
+
+      dataJson.closeDict();
+      dataStream.flush();
+      note.data = std::move(data);
+    } break;
     case PausedNotificationReason::kOther:
       note.reason = "other";
       break;
@@ -617,7 +654,7 @@ bool DebuggerDomainAgent::checkDebuggerEnabled(const m::Request &req) {
 }
 
 bool DebuggerDomainAgent::checkDebuggerPaused(const m::Request &req) {
-  if (!paused_) {
+  if (!paused_ && !asyncDebugger_.isWaitingForCommand()) {
     sendResponseToClient(m::makeErrorResponse(
         req.id, m::ErrorCode::InvalidRequest, "Debugger is not paused"));
     return false;

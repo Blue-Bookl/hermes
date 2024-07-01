@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved.
-// @generated SignedSource<<8903bc0e900a8cad42ef2719b464641b>>
+// @generated SignedSource<<31f8b58788b6a7fcfcd45dd78a74c3f9>>
 
 #pragma once
 
@@ -59,6 +59,7 @@ struct CompileScriptResponse;
 struct ConsoleAPICalledNotification;
 struct CustomPreview;
 struct DisableRequest;
+struct DiscardConsoleEntriesRequest;
 struct EnableRequest;
 struct EntryPreview;
 struct EvaluateRequest;
@@ -73,6 +74,7 @@ struct GetPropertiesRequest;
 struct GetPropertiesResponse;
 struct GlobalLexicalScopeNamesRequest;
 struct GlobalLexicalScopeNamesResponse;
+struct InspectRequestedNotification;
 struct InternalPropertyDescriptor;
 struct ObjectPreview;
 struct PropertyDescriptor;
@@ -153,6 +155,7 @@ struct RequestHandler {
   virtual void handle(const runtime::CallFunctionOnRequest &req) = 0;
   virtual void handle(const runtime::CompileScriptRequest &req) = 0;
   virtual void handle(const runtime::DisableRequest &req) = 0;
+  virtual void handle(const runtime::DiscardConsoleEntriesRequest &req) = 0;
   virtual void handle(const runtime::EnableRequest &req) = 0;
   virtual void handle(const runtime::EvaluateRequest &req) = 0;
   virtual void handle(const runtime::GetHeapUsageRequest &req) = 0;
@@ -195,6 +198,7 @@ struct NoopRequestHandler : public RequestHandler {
   void handle(const runtime::CallFunctionOnRequest &req) override {}
   void handle(const runtime::CompileScriptRequest &req) override {}
   void handle(const runtime::DisableRequest &req) override {}
+  void handle(const runtime::DiscardConsoleEntriesRequest &req) override {}
   void handle(const runtime::EnableRequest &req) override {}
   void handle(const runtime::EvaluateRequest &req) override {}
   void handle(const runtime::GetHeapUsageRequest &req) override {}
@@ -852,6 +856,15 @@ struct runtime::DisableRequest : public Request {
   void accept(RequestHandler &handler) const override;
 };
 
+struct runtime::DiscardConsoleEntriesRequest : public Request {
+  DiscardConsoleEntriesRequest();
+  static std::unique_ptr<DiscardConsoleEntriesRequest> tryMake(
+      const JSONObject *obj);
+
+  JSONValue *toJsonVal(JSONFactory &factory) const override;
+  void accept(RequestHandler &handler) const override;
+};
+
 struct runtime::EnableRequest : public Request {
   EnableRequest();
   static std::unique_ptr<EnableRequest> tryMake(const JSONObject *obj);
@@ -895,6 +908,7 @@ struct runtime::GetPropertiesRequest : public Request {
 
   runtime::RemoteObjectId objectId{};
   std::optional<bool> ownProperties;
+  std::optional<bool> accessorPropertiesOnly;
   std::optional<bool> generatePreview;
 };
 
@@ -1173,6 +1187,17 @@ struct runtime::ExecutionContextCreatedNotification : public Notification {
   JSONValue *toJsonVal(JSONFactory &factory) const override;
 
   runtime::ExecutionContextDescription context{};
+};
+
+struct runtime::InspectRequestedNotification : public Notification {
+  InspectRequestedNotification();
+  static std::unique_ptr<InspectRequestedNotification> tryMake(
+      const JSONObject *obj);
+  JSONValue *toJsonVal(JSONFactory &factory) const override;
+
+  runtime::RemoteObject object{};
+  JSONBlob hints;
+  std::optional<runtime::ExecutionContextId> executionContextId;
 };
 
 } // namespace message
